@@ -2,6 +2,7 @@ package bigcompressor
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"io"
 	"os"
@@ -12,8 +13,11 @@ import (
 	"github.com/klauspost/compress/s2"
 )
 
+var chunkseparator = bytes.NewBufferString("_cHuNK_")
+
 type BigCompressor struct {
 	MaxPrecompressChunkSize int64
+	MaxDecompressBufferSize int64
 	CombineChunk            bool
 	buffer                  *bytes.Buffer
 
@@ -61,16 +65,112 @@ func (bc *BigCompressor) Compress(src, dst string) error {
 				return err
 			}
 		}
+		bc.buffer.Reset()
 	}
 	return nil
 }
-func (bc *BigCompressor) Decompress(dst string) error {
 
+func (bc *BigCompressor) Decompress(src, dst string) error {
+	if bc.buffer == nil {
+		bc.buffer = &bytes.Buffer{}
+	}
+	bc.buffer.Reset()
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	csBytes := chunkseparator.Bytes()
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, bc.MaxDecompressBufferSize)
+	scanner.Buffer(buf, bufio.MaxScanTokenSize)
+	scanFn := func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		commaidx := bytes.Index(data, csBytes)
+		if commaidx > 0 {
+			// we need to return the next position
+			buffer := data[:commaidx]
+			return commaidx + len(csBytes), bytes.TrimSpace(buffer), nil
+		}
+		// if we are at the end of the string, just return the entire buffer
+		if atEOF {
+			// but only do that when there is some data. If not, this might mean
+			// that we've reached the end of our input CSV string
+			if len(data) > 0 {
+				return len(data), bytes.TrimSpace(data), nil
+			}
+		}
+
+		// when 0, nil, nil is returned, this is a signal to the interface to read
+		// more data in from the input reader. In this case, this input is our
+		// string reader and this pretty much will never occur.
+		return 0, nil, nil
+	}
+	scanner.Split(scanFn)
+	for scanner.Scan() {
+		n := scanner.Bytes()
+		// _, err = bc.buffer.Write(n)
+		// if err != nil {
+		// 	return err
+		// }
+		if len(n) > 100 {
+			_, err = bc.buffer.Write(n)
+			if err != nil {
+				return err
+			}
+			err = bc.decompressChunk(dst)
+			if err != nil {
+				return err
+			}
+			bc.buffer.Reset()
+		}
+
+	}
+	return nil
+}
+
+func (bc *BigCompressor) decompressChunk(dst string) error {
+	zr := s2.NewReader(bc.buffer)
+	tr := tar.NewReader(zr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break // End of archive
+		}
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, header.Name)
+
+		// check the type
+		switch header.Typeflag {
+		// if it's a file create it
+		case tar.TypeReg:
+			dirName := filepath.Dir(target)
+			if _, serr := os.Stat(dirName); serr != nil {
+				merr := os.MkdirAll(dirName, 0700)
+				if merr != nil {
+					panic(merr)
+				}
+			}
+			fileToWrite, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			// copy over contents
+			if _, err := io.Copy(fileToWrite, tr); err != nil {
+				return err
+			}
+			// manually close here after each file operation; defering would cause each file close
+			// to wait until all operations have completed.
+			fileToWrite.Close()
+		}
+	}
 	return nil
 }
 
 func (bc *BigCompressor) writeBufferToFile() error {
-	if _, err := bc.compressFile.Write(bc.buffer.Bytes()); err != nil {
+	_, err := bc.compressFile.Write(append(bc.buffer.Bytes(), chunkseparator.Bytes()...))
+	if err != nil {
 		return err
 	}
 	return nil
@@ -92,7 +192,7 @@ func (bc *BigCompressor) compressChunk(src string, chunk *dataChunk) error {
 	if bc.buffer == nil {
 		bc.buffer = &bytes.Buffer{}
 	}
-	bc.buffer.Reset()
+
 	zr := s2.NewWriter(bc.buffer)
 	tw := tar.NewWriter(zr)
 	for _, fi := range chunk.files {
