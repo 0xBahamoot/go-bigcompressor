@@ -43,7 +43,7 @@ func (bc *BigCompressor) Compress(src, dst string) error {
 
 	if bc.CombineChunk {
 		var err error
-		bc.compressFile, err = os.OpenFile(dst, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0700)
+		bc.compressFile, err = os.OpenFile(dst, os.O_CREATE|os.O_RDWR, 0700)
 		defer bc.compressFile.Close()
 		if err != nil {
 			return err
@@ -108,10 +108,6 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 	scanner.Split(scanFn)
 	for scanner.Scan() {
 		n := scanner.Bytes()
-		// _, err = bc.buffer.Write(n)
-		// if err != nil {
-		// 	return err
-		// }
 		if len(n) > 100 {
 			_, err = bc.buffer.Write(n)
 			if err != nil {
