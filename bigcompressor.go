@@ -108,7 +108,7 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 	scanner.Split(scanFn)
 	for scanner.Scan() {
 		n := scanner.Bytes()
-		if len(n) > 100 {
+		if len(n) > 10 {
 			_, err = bc.buffer.Write(n)
 			if err != nil {
 				return err
@@ -231,14 +231,13 @@ func (bc BigCompressor) createChunkInfo(src string) []dataChunk {
 	dataChunks := []dataChunk{}
 	currentChunk := 0
 
+	dataChunks = append(dataChunks, dataChunk{
+		chunkNumber: currentChunk,
+		files:       []fileInfo{},
+		totalSize:   0,
+	})
+
 	filepath.Walk(src, func(file string, fi os.FileInfo, err error) error {
-		if len(dataChunks)-1 != currentChunk {
-			dataChunks = append(dataChunks, dataChunk{
-				chunkNumber: currentChunk,
-				files:       []fileInfo{},
-				totalSize:   0,
-			})
-		}
 		chunk := &dataChunks[currentChunk]
 		if chunk.totalSize+fi.Size() <= bc.MaxPrecompressChunkSize {
 			chunk.files = append(chunk.files, fileInfo{
@@ -250,6 +249,19 @@ func (bc BigCompressor) createChunkInfo(src string) []dataChunk {
 			}
 		} else {
 			currentChunk++
+			dataChunks = append(dataChunks, dataChunk{
+				chunkNumber: currentChunk,
+				files:       []fileInfo{},
+				totalSize:   0,
+			})
+			chunk = &dataChunks[currentChunk]
+			chunk.files = append(chunk.files, fileInfo{
+				file:     file,
+				FileInfo: fi,
+			})
+			if !fi.IsDir() {
+				chunk.totalSize += fi.Size()
+			}
 		}
 		return nil
 	})
