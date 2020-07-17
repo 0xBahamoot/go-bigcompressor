@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/klauspost/compress/s2"
+	"github.com/klauspost/compress/zstd"
 )
 
 var chunkseparator = bytes.NewBufferString("_cHuNK_")
@@ -21,12 +21,13 @@ type BigCompressor struct {
 	CombineChunk            bool
 	buffer                  *bytes.Buffer
 
+	ioCPBuffer   []byte
 	compressFile *os.File
 }
 
 type dataChunk struct {
 	chunkNumber int
-	files       []fileInfo
+	files       []*fileInfo
 	totalSize   int64
 }
 
@@ -49,13 +50,20 @@ func (bc *BigCompressor) Compress(src, dst string) error {
 			return err
 		}
 	}
-	for _, dataChunk := range dataChunks {
-		err := bc.compressChunk(src, &dataChunk)
+	if bc.buffer == nil {
+		bc.buffer = &bytes.Buffer{}
+	}
+	var dChunk *dataChunk
+	if bc.ioCPBuffer == nil {
+		bc.ioCPBuffer = make([]byte, 32*1024)
+	}
+	for _, dChunk = range dataChunks {
+		err := bc.compressChunkNoAlloc(src, dChunk)
 		if err != nil {
 			return err
 		}
 		if !bc.CombineChunk {
-			err = bc.writeChunk(dst + "_" + strconv.Itoa(dataChunk.chunkNumber))
+			err = bc.writeChunk(dst + "_" + strconv.Itoa(dChunk.chunkNumber))
 			if err != nil {
 				return err
 			}
@@ -80,6 +88,9 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 		return err
 	}
 	defer f.Close()
+	if bc.ioCPBuffer == nil {
+		bc.ioCPBuffer = make([]byte, 32*1024)
+	}
 	csBytes := chunkseparator.Bytes()
 	scanner := bufio.NewScanner(f)
 	buf := make([]byte, bc.MaxDecompressBufferSize)
@@ -124,28 +135,37 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 	return nil
 }
 
-func (bc *BigCompressor) decompressChunk(dst string) error {
-	zr := s2.NewReader(bc.buffer)
-	tr := tar.NewReader(zr)
+var zstdDecode *zstd.Decoder
+var tarDecode *tar.Reader
+
+func (bc BigCompressor) decompressChunk(dst string) error {
+	if zstdDecode == nil {
+		zstdDecode, _ = zstd.NewReader(bc.buffer)
+		tarDecode = tar.NewReader(zstdDecode)
+	} else {
+		zstdDecode.Reset(bc.buffer)
+	}
+
+	var target, dirName string
 	for {
-		header, err := tr.Next()
+		header, err := tarDecode.Next()
 		if err == io.EOF {
 			break // End of archive
 		}
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dst, header.Name)
+		target = filepath.Join(dst, header.Name)
 
 		// check the type
 		switch header.Typeflag {
 		// if it's a file create it
 		case tar.TypeReg:
-			dirName := filepath.Dir(target)
-			if _, serr := os.Stat(dirName); serr != nil {
-				merr := os.MkdirAll(dirName, 0700)
-				if merr != nil {
-					panic(merr)
+			dirName = filepath.Dir(target)
+			if _, err = os.Stat(dirName); err != nil {
+				err = os.MkdirAll(dirName, 0700)
+				if err != nil {
+					panic(err)
 				}
 			}
 			fileToWrite, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
@@ -153,7 +173,7 @@ func (bc *BigCompressor) decompressChunk(dst string) error {
 				return err
 			}
 			// copy over contents
-			if _, err := io.Copy(fileToWrite, tr); err != nil {
+			if _, err = io.CopyBuffer(fileToWrite, tarDecode, bc.ioCPBuffer); err != nil {
 				return err
 			}
 			// manually close here after each file operation; defering would cause each file close
@@ -165,10 +185,15 @@ func (bc *BigCompressor) decompressChunk(dst string) error {
 }
 
 func (bc *BigCompressor) writeBufferToFile() error {
-	_, err := bc.compressFile.Write(append(bc.buffer.Bytes(), chunkseparator.Bytes()...))
+	_, err := bc.compressFile.Write(bc.buffer.Bytes())
 	if err != nil {
 		return err
 	}
+	_, err = bc.compressFile.Write(chunkseparator.Bytes())
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -184,63 +209,63 @@ func (bc *BigCompressor) writeChunk(chunkDst string) error {
 	return nil
 }
 
-func (bc *BigCompressor) compressChunk(src string, chunk *dataChunk) error {
-	if bc.buffer == nil {
-		bc.buffer = &bytes.Buffer{}
-	}
+// func (bc *BigCompressor) compressChunk(src string, chunk *dataChunk) error {
+// 	if bc.buffer == nil {
+// 		bc.buffer = &bytes.Buffer{}
+// 	}
 
-	zr := s2.NewWriter(bc.buffer)
-	tw := tar.NewWriter(zr)
-	for _, fi := range chunk.files {
-		header, err := tar.FileInfoHeader(fi, fi.file)
+// 	zr, _ := zstd.NewWriter(bc.buffer)
+// 	tw := tar.NewWriter(zr)
+// 	for _, fi := range chunk.files {
+// 		header, err := tar.FileInfoHeader(fi, fi.file)
 
-		if err != nil {
-			return err
-		}
-		header.Name = strings.Replace(fi.file, src, "", 1)
+// 		if err != nil {
+// 			return err
+// 		}
+// 		header.Name = strings.Replace(fi.file, src, "", 1)
 
-		// write header
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-		// if not a dir, write file content
-		if !fi.IsDir() {
-			data, err := os.Open(fi.file)
-			defer data.Close()
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(tw, data); err != nil {
-				return err
-			}
-		}
-	}
+// 		// write header
+// 		if err := tw.WriteHeader(header); err != nil {
+// 			return err
+// 		}
+// 		// if not a dir, write file content
+// 		if !fi.IsDir() {
+// 			data, err := os.Open(fi.file)
+// 			defer data.Close()
+// 			if err != nil {
+// 				return err
+// 			}
+// 			if _, err := io.CopyBuffer(tw, data, bc.ioCPBuffer); err != nil {
+// 				return err
+// 			}
+// 		}
+// 	}
 
-	// produce tar
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	// produce gzip
-	if err := zr.Close(); err != nil {
-		return err
-	}
-	return nil
-}
+// 	// produce tar
+// 	if err := tw.Close(); err != nil {
+// 		return err
+// 	}
+// 	// produce gzip
+// 	if err := zr.Close(); err != nil {
+// 		return err
+// 	}
+// 	return nil
+// }
 
-func (bc BigCompressor) createChunkInfo(src string) []dataChunk {
-	dataChunks := []dataChunk{}
+func (bc BigCompressor) createChunkInfo(src string) []*dataChunk {
+	dataChunks := []*dataChunk{}
 	currentChunk := 0
 
-	dataChunks = append(dataChunks, dataChunk{
+	dataChunks = append(dataChunks, &dataChunk{
 		chunkNumber: currentChunk,
-		files:       []fileInfo{},
+		files:       []*fileInfo{},
 		totalSize:   0,
 	})
 
 	filepath.Walk(src, func(file string, fi os.FileInfo, err error) error {
-		chunk := &dataChunks[currentChunk]
+		chunk := dataChunks[currentChunk]
 		if chunk.totalSize+fi.Size() <= bc.MaxPrecompressChunkSize {
-			chunk.files = append(chunk.files, fileInfo{
+			chunk.files = append(chunk.files, &fileInfo{
 				file:     file,
 				FileInfo: fi,
 			})
@@ -249,13 +274,13 @@ func (bc BigCompressor) createChunkInfo(src string) []dataChunk {
 			}
 		} else {
 			currentChunk++
-			dataChunks = append(dataChunks, dataChunk{
+			dataChunks = append(dataChunks, &dataChunk{
 				chunkNumber: currentChunk,
-				files:       []fileInfo{},
+				files:       []*fileInfo{},
 				totalSize:   0,
 			})
-			chunk = &dataChunks[currentChunk]
-			chunk.files = append(chunk.files, fileInfo{
+			chunk = dataChunks[currentChunk]
+			chunk.files = append(chunk.files, &fileInfo{
 				file:     file,
 				FileInfo: fi,
 			})
@@ -266,4 +291,51 @@ func (bc BigCompressor) createChunkInfo(src string) []dataChunk {
 		return nil
 	})
 	return dataChunks
+}
+
+var zstdEncode *zstd.Encoder
+var tarEncode *tar.Writer
+
+func (bc *BigCompressor) compressChunkNoAlloc(src string, chunk *dataChunk) error {
+	if zstdEncode == nil {
+		zstdEncode, _ = zstd.NewWriter(bc.buffer)
+		tarEncode = tar.NewWriter(zstdEncode)
+	} else {
+		zstdEncode.Reset(bc.buffer)
+	}
+	var fi *fileInfo
+	for _, fi = range chunk.files {
+		header, err := tar.FileInfoHeader(fi, fi.file)
+
+		if err != nil {
+			return err
+		}
+		header.Name = strings.Replace(fi.file, src, "", 1)
+
+		// write header
+		if err := tarEncode.WriteHeader(header); err != nil {
+			return err
+		}
+		// if not a dir, write file content
+		if !fi.IsDir() {
+			data, err := os.Open(fi.file)
+			if err != nil {
+				return err
+			}
+			if _, err := io.CopyBuffer(tarEncode, data, bc.ioCPBuffer); err != nil {
+				return err
+			}
+			data.Close()
+		}
+	}
+
+	// produce tar
+	if err := tarEncode.Flush(); err != nil {
+		return err
+	}
+	// produce gzip
+	if err := zstdEncode.Close(); err != nil {
+		return err
+	}
+	return nil
 }
