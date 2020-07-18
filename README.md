@@ -1,2 +1,2 @@
 # go-bigcompressor
-A golang compressor utility for compressing large folder
+A golang high performance & memory efficent compressor library for compressing large folder
