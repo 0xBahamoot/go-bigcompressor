@@ -136,16 +136,17 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 }
 
 var zstdDecode *zstd.Decoder
-var tarDecode *tar.Reader
+
+// var tarDecode *tar.Reader
 
 func (bc BigCompressor) decompressChunk(dst string) error {
 	if zstdDecode == nil {
 		zstdDecode, _ = zstd.NewReader(bc.buffer)
-		tarDecode = tar.NewReader(zstdDecode)
 	} else {
 		zstdDecode.Reset(bc.buffer)
 	}
 
+	tarDecode := tar.NewReader(zstdDecode)
 	var target, dirName string
 	for {
 		header, err := tarDecode.Next()
