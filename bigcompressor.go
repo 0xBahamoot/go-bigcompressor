@@ -78,6 +78,15 @@ func (bc *BigCompressor) Compress(src, dst string) error {
 	return nil
 }
 
+//DecompressFolder decompress files in a folder
+func (bc *BigCompressor) DecompressFolder(src, dst string) error {
+	filepath.Walk(src, func(file string, fi os.FileInfo, err error) error {
+		return bc.Decompress(file, dst)
+	})
+	return nil
+}
+
+//Decompress decompress a single file
 func (bc *BigCompressor) Decompress(src, dst string) error {
 	if bc.buffer == nil {
 		bc.buffer = &bytes.Buffer{}
@@ -135,8 +144,6 @@ func scanFn(data []byte, atEOF bool) (advance int, token []byte, err error) {
 }
 
 var zstdDecode *zstd.Decoder
-
-// var tarDecode *tar.Reader
 
 func (bc BigCompressor) decompressChunk(dst string) error {
 	if zstdDecode == nil {
@@ -210,8 +217,6 @@ func (bc *BigCompressor) writeChunk(chunkDst string) error {
 }
 
 var zstdEncode *zstd.Encoder
-
-// var tarEncode *tar.Writer
 
 func (bc *BigCompressor) compressChunk(src string, chunk *dataChunk) error {
 	if zstdEncode == nil {
