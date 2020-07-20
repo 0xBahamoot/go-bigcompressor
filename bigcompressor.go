@@ -58,7 +58,7 @@ func (bc *BigCompressor) Compress(src, dst string) error {
 		bc.ioCPBuffer = make([]byte, 32*1024)
 	}
 	for _, dChunk = range dataChunks {
-		err := bc.compressChunkNoAlloc(src, dChunk)
+		err := bc.compressChunk(src, dChunk)
 		if err != nil {
 			return err
 		}
@@ -91,31 +91,9 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 	if bc.ioCPBuffer == nil {
 		bc.ioCPBuffer = make([]byte, 32*1024)
 	}
-	csBytes := chunkseparator.Bytes()
 	scanner := bufio.NewScanner(f)
 	buf := make([]byte, bc.MaxDecompressBufferSize)
 	scanner.Buffer(buf, bufio.MaxScanTokenSize)
-	scanFn := func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-		commaidx := bytes.Index(data, csBytes)
-		if commaidx > 0 {
-			// we need to return the next position
-			buffer := data[:commaidx]
-			return commaidx + len(csBytes), bytes.TrimSpace(buffer), nil
-		}
-		// if we are at the end of the string, just return the entire buffer
-		if atEOF {
-			// but only do that when there is some data. If not, this might mean
-			// that we've reached the end of our input CSV string
-			if len(data) > 0 {
-				return len(data), bytes.TrimSpace(data), nil
-			}
-		}
-
-		// when 0, nil, nil is returned, this is a signal to the interface to read
-		// more data in from the input reader. In this case, this input is our
-		// string reader and this pretty much will never occur.
-		return 0, nil, nil
-	}
 	scanner.Split(scanFn)
 	for scanner.Scan() {
 		n := scanner.Bytes()
@@ -133,6 +111,27 @@ func (bc *BigCompressor) Decompress(src, dst string) error {
 
 	}
 	return nil
+}
+func scanFn(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	commaidx := bytes.Index(data, chunkseparator.Bytes())
+	if commaidx > 0 {
+		// we need to return the next position
+		buffer := data[:commaidx]
+		return commaidx + len(chunkseparator.Bytes()), bytes.TrimSpace(buffer), nil
+	}
+	// if we are at the end of the string, just return the entire buffer
+	if atEOF {
+		// but only do that when there is some data. If not, this might mean
+		// that we've reached the end of our input CSV string
+		if len(data) > 0 {
+			return len(data), bytes.TrimSpace(data), nil
+		}
+	}
+
+	// when 0, nil, nil is returned, this is a signal to the interface to read
+	// more data in from the input reader. In this case, this input is our
+	// string reader and this pretty much will never occur.
+	return 0, nil, nil
 }
 
 var zstdDecode *zstd.Decoder
@@ -210,48 +209,53 @@ func (bc *BigCompressor) writeChunk(chunkDst string) error {
 	return nil
 }
 
-// func (bc *BigCompressor) compressChunk(src string, chunk *dataChunk) error {
-// 	if bc.buffer == nil {
-// 		bc.buffer = &bytes.Buffer{}
-// 	}
+var zstdEncode *zstd.Encoder
 
-// 	zr, _ := zstd.NewWriter(bc.buffer)
-// 	tw := tar.NewWriter(zr)
-// 	for _, fi := range chunk.files {
-// 		header, err := tar.FileInfoHeader(fi, fi.file)
+// var tarEncode *tar.Writer
 
-// 		if err != nil {
-// 			return err
-// 		}
-// 		header.Name = strings.Replace(fi.file, src, "", 1)
+func (bc *BigCompressor) compressChunk(src string, chunk *dataChunk) error {
+	if zstdEncode == nil {
+		zstdEncode, _ = zstd.NewWriter(bc.buffer)
+	} else {
+		zstdEncode.Reset(bc.buffer)
+	}
+	tarEncode := tar.NewWriter(zstdEncode)
+	var fi *fileInfo
+	for _, fi = range chunk.files {
+		header, err := tar.FileInfoHeader(fi, fi.file)
 
-// 		// write header
-// 		if err := tw.WriteHeader(header); err != nil {
-// 			return err
-// 		}
-// 		// if not a dir, write file content
-// 		if !fi.IsDir() {
-// 			data, err := os.Open(fi.file)
-// 			defer data.Close()
-// 			if err != nil {
-// 				return err
-// 			}
-// 			if _, err := io.CopyBuffer(tw, data, bc.ioCPBuffer); err != nil {
-// 				return err
-// 			}
-// 		}
-// 	}
+		if err != nil {
+			return err
+		}
+		header.Name = strings.Replace(fi.file, src, "", 1)
 
-// 	// produce tar
-// 	if err := tw.Close(); err != nil {
-// 		return err
-// 	}
-// 	// produce gzip
-// 	if err := zr.Close(); err != nil {
-// 		return err
-// 	}
-// 	return nil
-// }
+		// write header
+		if err := tarEncode.WriteHeader(header); err != nil {
+			return err
+		}
+		// if not a dir, write file content
+		if !fi.IsDir() {
+			data, err := os.Open(fi.file)
+			if err != nil {
+				return err
+			}
+			if _, err := io.CopyBuffer(tarEncode, data, bc.ioCPBuffer); err != nil {
+				return err
+			}
+			data.Close()
+		}
+	}
+
+	// produce tar
+	if err := tarEncode.Close(); err != nil {
+		return err
+	}
+	// produce gzip
+	if err := zstdEncode.Close(); err != nil {
+		return err
+	}
+	return nil
+}
 
 func (bc BigCompressor) createChunkInfo(src string) []*dataChunk {
 	dataChunks := []*dataChunk{}
@@ -289,54 +293,7 @@ func (bc BigCompressor) createChunkInfo(src string) []*dataChunk {
 				chunk.totalSize += fi.Size()
 			}
 		}
-		return nil
+		return err
 	})
 	return dataChunks
-}
-
-var zstdEncode *zstd.Encoder
-var tarEncode *tar.Writer
-
-func (bc *BigCompressor) compressChunkNoAlloc(src string, chunk *dataChunk) error {
-	if zstdEncode == nil {
-		zstdEncode, _ = zstd.NewWriter(bc.buffer)
-		tarEncode = tar.NewWriter(zstdEncode)
-	} else {
-		zstdEncode.Reset(bc.buffer)
-	}
-	var fi *fileInfo
-	for _, fi = range chunk.files {
-		header, err := tar.FileInfoHeader(fi, fi.file)
-
-		if err != nil {
-			return err
-		}
-		header.Name = strings.Replace(fi.file, src, "", 1)
-
-		// write header
-		if err := tarEncode.WriteHeader(header); err != nil {
-			return err
-		}
-		// if not a dir, write file content
-		if !fi.IsDir() {
-			data, err := os.Open(fi.file)
-			if err != nil {
-				return err
-			}
-			if _, err := io.CopyBuffer(tarEncode, data, bc.ioCPBuffer); err != nil {
-				return err
-			}
-			data.Close()
-		}
-	}
-
-	// produce tar
-	if err := tarEncode.Flush(); err != nil {
-		return err
-	}
-	// produce gzip
-	if err := zstdEncode.Close(); err != nil {
-		return err
-	}
-	return nil
 }
